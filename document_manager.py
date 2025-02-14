@@ -10,6 +10,7 @@ from rag_backend import (
     save_stores
 )
 import numpy as np
+import json
 from dotenv import load_dotenv
 
 load_dotenv()

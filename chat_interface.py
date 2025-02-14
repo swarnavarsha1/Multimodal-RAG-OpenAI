@@ -153,7 +153,7 @@ def main():
                     # Search for relevant content
                     distances, result = index.search(
                         np.array(query_embedding, dtype=np.float32).reshape(1,-1), 
-                        k=5
+                        k=10
                     )
                     
                     # Get matched items

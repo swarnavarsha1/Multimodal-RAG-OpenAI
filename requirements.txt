@@ -19,3 +19,4 @@ python-dotenv
 transformers
 torch
 pillow
+scikit-learn

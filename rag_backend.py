@@ -293,27 +293,28 @@ def generate_multimodal_embeddings(prompt=None, image=None, output_embedding_len
         return None
 
 def load_or_initialize_stores():
-    """Load or initialize vector store and cache with UTF-8 support"""
+    """Load or initialize vector store and cache with efficient large-scale search"""
     embedding_vector_dimension = 384
     
     if os.path.exists(os.path.join(VECTOR_STORE, FAISS_INDEX)):
         index = faiss.read_index(os.path.join(VECTOR_STORE, FAISS_INDEX))
         with open(os.path.join(VECTOR_STORE, ITEMS_PICKLE), 'rb') as f:
-            # Load with UTF-8 encoding handling
             all_items = pickle.load(f)
-            # Ensure all text content is UTF-8
             for item in all_items:
                 if 'text' in item:
                     item['text'] = item['text'].encode('utf-8').decode('utf-8', errors='replace')
     else:
-        index = faiss.IndexFlatL2(embedding_vector_dimension)
+        # Initialize with HNSW index for efficient large-scale search
+        index = faiss.IndexHNSWFlat(embedding_vector_dimension, 32)  # 32 neighbors per node
+        # Configure for better recall vs speed tradeoff
+        index.hnsw.efConstruction = 40  # Higher value = better accuracy, slower construction
+        index.hnsw.efSearch = 32  # Higher value = better accuracy, slower search
         all_items = []
     
     query_cache_path = os.path.join(VECTOR_STORE, QUERY_EMBEDDINGS_CACHE)
     if os.path.exists(query_cache_path):
         with open(query_cache_path, 'rb') as f:
             query_embeddings_cache = pickle.load(f)
-            # Ensure queries are UTF-8 encoded
             query_embeddings_cache = {
                 k.encode('utf-8').decode('utf-8', errors='replace'): v 
                 for k, v in query_embeddings_cache.items()
@@ -355,7 +356,7 @@ def invoke_gpt_model(prompt, matched_items):
         system_msg = """You are a helpful and intelligent assistant that combines natural conversation with strict document accuracy. Follow these guidelines:
 
 1. Natural & Intelligent Interaction:
-   - Be conversational and engaging like Claude/ChatGPT
+   - Be conversational and engaging like ChatGPT
    - Understand user intent and context deeply
    - Explain complex information clearly
    - Break down difficult concepts
@@ -371,6 +372,8 @@ def invoke_gpt_model(prompt, matched_items):
    - If information isn't available, clearly say so
    - For partial information, explain what's available and what's missing
    - Keep all facts and details exactly as documented
+   - Look for relationships between related items in the same context
+   - Consider contextual information even when exact matches aren't found
 
 3. Dynamic Content Handling:
    - Let each document's structure guide preservation
@@ -379,6 +382,7 @@ def invoke_gpt_model(prompt, matched_items):
    - Preserve meaningful organization
    - Respect document hierarchies
    - Keep original presentation when it matters for understanding
+   - Connect related sections and concepts
 
 4. Response Quality:
    - Combine conversational tone with precision
@@ -389,16 +393,48 @@ def invoke_gpt_model(prompt, matched_items):
    - Maintain natural flow
    - Write in clear paragraphs
    - Use lists only when they improve understanding
+   - Group related information together
 
-5. References:
+5. Cross-Domain Understanding:
+   - Recognize document types and their domain context
+   - Connect related concepts within same domain
+   - Understand domain-specific terminology
+   - Handle numerical data and metrics appropriately
+   - Identify relationships between items in same category
+   - Respect domain-specific formatting and conventions
+   - Maintain consistency in technical terminology
+   - Handle multiple domains without mixing contexts
+   - Scale effectively across large document sets
+
+6. Document Organization:
+   - Group related information by domain and category
+   - Maintain hierarchical relationships in documentation
+   - Connect related procedures or concepts
+   - Consider dependencies and prerequisites
+   - Preserve domain-specific structures
+   - Handle cross-references between related documents
+   - Understand version relationships if present
+   - Scale across large document collections efficiently
+
+7. Content Adaptability:
+   - Adapt response style to document type
+   - Use appropriate terminology for each domain
+   - Maintain consistent formatting per domain
+   - Handle diverse data types (text, tables, technical specs)
+   - Scale response detail based on content complexity
+   - Preserve domain-specific accuracy requirements
+   - Connect related information across document sets
+
+8. References and Source Attribution:
    - End with "**References:**"
    - List each source on a new line with hyphen
    - Format: "- [Source: filename, page X]"
    - Sort by page number
    - No duplicates
    - Only include used sources
+   - Maintain traceability to source documents
 
-6. Strict Document Adherence:
+9. Strict Document Adherence:
    - ZERO hallucination - never generate information not in documents
    - NEVER use knowledge from external sources
    - If no information exists in documents, respond ONLY with: "I don't have any information about that in the provided documents"
@@ -409,14 +445,38 @@ def invoke_gpt_model(prompt, matched_items):
    - Every statement must be traceable to document content
    - Even when explaining simply, use only document information
 
-Remember: Be as engaging as Claude/ChatGPT while ensuring every piece of information comes from the documents."""
+- Understanding Query Variations:
+  - Recognize different ways to ask the same question
+  - Match queries with semantic variations
+  - Connect related terms and synonyms
+  - Handle partial matches intelligently
+
+- Information Synthesis:
+  - Combine related information across documents
+  - Verify numerical consistency (prices, quantities)
+  - Double-check factual accuracy before responding
+  - Cross-reference information for validation
+
+- Response Completeness:
+  - Check for complete information before responding
+  - Don't say "no information" if partial information exists
+  - Look for related terms and concepts
+  - Consider different phrasings of the same concept
+
+Remember: 
+1. Be as engaging as ChatGPT while ensuring every piece of information comes from the documents
+2. Maintain accuracy across all domains and document types
+3. Scale effectively across large document sets
+4. Preserve context and relationships between information
+5. Keep domain-specific terminology and conventions
+6. Never mix information from different domains inappropriately"""
     
         if not matched_items:
             return "I don't have any information about that in the provided documents."
             
         # Initialize the chat model with specific parameters
         chat = ChatOpenAI(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             max_tokens=1500,
             temperature=0.7,
             top_p=0.95,
@@ -427,7 +487,9 @@ Remember: Be as engaging as Claude/ChatGPT while ensuring every piece of informa
         # Organize matched items and track sources
         message_content = []
         used_sources = set()
+        context_window = []  # Store context from previous messages
         
+        # Sort matched items by relevance (assuming they're returned in relevance order)
         for item in matched_items:
             source_file = os.path.basename(item['path']).split('_')[0]
             page_num = item['page'] + 1
@@ -437,6 +499,11 @@ Remember: Be as engaging as Claude/ChatGPT while ensuring every piece of informa
                 # Clean up number and price formatting
                 text = re.sub(r'(\$\d+\.?\d*)\s+', r'\1 ', item['text'])
                 text = re.sub(r'(\d+\.?\d*)\s+', r'\1 ', text)
+                
+                # Add context about document structure
+                if 'metadata' in item and item['metadata'].get('is_heading'):
+                    context_window.append(f"Section: {text}")
+                
                 message_content.append({
                     "type": "text",
                     "text": f"{text}\n{source_info}"
@@ -444,6 +511,7 @@ Remember: Be as engaging as Claude/ChatGPT while ensuring every piece of informa
                 used_sources.add((source_info, page_num))
                 
             elif item['type'] == 'table':
+                # Add context about table structure
                 message_content.append({
                     "type": "text",
                     "text": f"{item['text']}\n{source_info}"
@@ -462,10 +530,21 @@ Remember: Be as engaging as Claude/ChatGPT while ensuring every piece of informa
                 })
                 used_sources.add((source_info, page_num))
 
-        # Add query context
+        # Add context window to message content
+        if context_window:
+            message_content.insert(0, {
+                "type": "text",
+                "text": "Document Context:\n" + "\n".join(context_window)
+            })
+
+        # Add query context with enhanced instructions
         query_context = (
             f"\nQuestion: {prompt}\n\n"
-            "Please provide a response based on the above content. "
+            "Please provide a response based on the above content, considering:\n"
+            "1. Direct matches to the query\n"
+            "2. Related information that provides context\n"
+            "3. Similar items or concepts that might be relevant\n"
+            "4. Document structure and organization\n"
             "Include only information from the provided documents."
         )
         message_content.append({
@@ -473,9 +552,9 @@ Remember: Be as engaging as Claude/ChatGPT while ensuring every piece of informa
             "text": query_context
         })
 
-        # Prepare messages for the chat model - Fixed formatting here
+        # Prepare messages for the chat model
         messages = [
-            SystemMessage(content=system_msg),  # Changed: system message doesn't need type specification
+            SystemMessage(content=system_msg),
             HumanMessage(content=message_content)
         ]
 
@@ -489,7 +568,7 @@ Remember: Be as engaging as Claude/ChatGPT while ensuring every piece of informa
                 references = "\n\n**References:**\n" + "\n".join(
                     f"- {source[0]}" for source in sorted(
                         used_sources,
-                        key=lambda x: x[1]
+                        key=lambda x: x[1]  # Sort by page number
                     )
                 )
                 response_content += references

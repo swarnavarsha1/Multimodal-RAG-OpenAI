@@ -4,3 +4,4 @@ vector_store/
 venvo/
 chatbot_validation.log
 .env
+rag_backend.log
